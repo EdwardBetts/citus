@@ -67,7 +67,8 @@ int ReplicationModel = REPLICATION_MODEL_COORDINATOR;
 /* local function forward declarations */
 static void CreateReferenceTable(Oid relationId);
 static void ConvertToDistributedTable(Oid relationId, char *distributionColumnName,
-									  char distributionMethod, uint32 colocationId);
+									  char distributionMethod, char replicationModel,
+									  uint32 colocationId);
 static char LookupDistributionMethod(Oid distributionMethodOid);
 static Oid SupportFunctionForColumn(Var *partitionColumn, Oid accessMethodId,
 									int16 supportFunctionNumber);
@@ -82,6 +83,7 @@ static void CreateHashDistributedTable(Oid relationId, char *distributionColumnN
 									   char *colocateWithTableName,
 									   int shardCount, int replicationFactor);
 static Oid ColumnType(Oid relationId, char *columnName);
+static void DisplayReplicationModelOverwriteNotice(void);
 
 /* exports for SQL callable functions */
 PG_FUNCTION_INFO_V1(master_create_distributed_table);
@@ -108,8 +110,11 @@ master_create_distributed_table(PG_FUNCTION_ARGS)
 
 	EnsureCoordinator();
 
+	DisplayReplicationModelOverwriteNotice();
+
 	ConvertToDistributedTable(distributedRelationId, distributionColumnName,
-							  distributionMethod, INVALID_COLOCATION_ID);
+							  distributionMethod, REPLICATION_MODEL_COORDINATOR,
+							  INVALID_COLOCATION_ID);
 
 	PG_RETURN_VOID();
 }
@@ -165,8 +170,11 @@ create_distributed_table(PG_FUNCTION_ARGS)
 	/* if distribution method is not hash, just create partition metadata */
 	if (distributionMethod != DISTRIBUTE_BY_HASH)
 	{
+		DisplayReplicationModelOverwriteNotice();
+
 		ConvertToDistributedTable(relationId, distributionColumnName,
-								  distributionMethod, INVALID_COLOCATION_ID);
+								  distributionMethod, REPLICATION_MODEL_COORDINATOR,
+								  INVALID_COLOCATION_ID);
 		PG_RETURN_VOID();
 	}
 
@@ -229,7 +237,7 @@ CreateReferenceTable(Oid relationId)
 
 	/* first, convert the relation into distributed relation */
 	ConvertToDistributedTable(relationId, distributionColumnName,
-							  DISTRIBUTE_BY_NONE, colocationId);
+							  DISTRIBUTE_BY_NONE, REPLICATION_MODEL_2PC, colocationId);
 
 	/* now, create the single shard replicated to all nodes */
 	CreateReferenceTableShard(relationId);
@@ -251,27 +259,17 @@ CreateReferenceTable(Oid relationId)
  */
 static void
 ConvertToDistributedTable(Oid relationId, char *distributionColumnName,
-						  char distributionMethod, uint32 colocationId)
+						  char distributionMethod, char replicationModel,
+						  uint32 colocationId)
 {
 	Relation relation = NULL;
 	TupleDesc relationDesc = NULL;
 	char *relationName = NULL;
 	char relationKind = 0;
 	Var *distributionColumn = NULL;
-	char replicationModel = REPLICATION_MODEL_INVALID;
 
 	/* check global replication settings before continuing */
-	EnsureReplicationSettings(InvalidOid);
-
-	/* distribute by none tables use 2PC replication; otherwise use GUC setting */
-	if (distributionMethod == DISTRIBUTE_BY_NONE)
-	{
-		replicationModel = REPLICATION_MODEL_2PC;
-	}
-	else
-	{
-		replicationModel = ReplicationModel;
-	}
+	EnsureReplicationSettings(InvalidOid, replicationModel);
 
 	/*
 	 * Lock target relation with an exclusive lock - there's no way to make
@@ -949,7 +947,7 @@ CreateHashDistributedTable(Oid relationId, char *distributionColumnName,
 
 	/* create distributed table metadata */
 	ConvertToDistributedTable(relationId, distributionColumnName, DISTRIBUTE_BY_HASH,
-							  colocationId);
+							  ReplicationModel, colocationId);
 
 	/* create shards */
 	if (sourceRelationId != InvalidOid)
@@ -991,15 +989,13 @@ ColumnType(Oid relationId, char *columnName)
  * is detected.
  */
 void
-EnsureReplicationSettings(Oid relationId)
+EnsureReplicationSettings(Oid relationId, char replicationModel)
 {
-	char replicationModel = (char) ReplicationModel;
 	char *msgSuffix = "the streaming replication model";
 	char *extraHint = " or setting \"citus.replication_model\" to \"statement\"";
 
 	if (relationId != InvalidOid)
 	{
-		replicationModel = TableReplicationModel(relationId);
 		msgSuffix = "tables which use the streaming replication model";
 		extraHint = "";
 	}
@@ -1011,5 +1007,22 @@ EnsureReplicationSettings(Oid relationId)
 							   msgSuffix),
 						errhint("Try again after reducing \"citus.shard_replication_"
 								"factor\" to one%s.", extraHint)));
+	}
+}
+
+
+/*
+ * DisplayReplicationModelOverwriteNotice shows a notice message to tell that we use
+ * statement based replication, even if the citus.replication_factor setting
+ * is set to streaming.
+ */
+static void
+DisplayReplicationModelOverwriteNotice(void)
+{
+	if (ReplicationModel != REPLICATION_MODEL_COORDINATOR)
+	{
+		ereport(NOTICE, (errmsg("using statement based replication"),
+						 errhint("Use create_distributed_table to create "
+								 "streaming replicated tables.")));
 	}
 }
